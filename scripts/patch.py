@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+Black-Amethyst rebranding + offline-account patcher.
+
+Applies a small, well-defined set of edits to a *fresh upstream checkout* of
+AngelAuraMC/Amethyst-Android so that the resulting APK:
+
+  1. Lets you add an OFFLINE (local) account with no internet and no prior
+     online account -- "right off the bat".  (the functional change)
+  2. Is branded "Black-Amethyst".                     (the gimmick)
+  3. Uses our own application id / provider authorities. (a proper package name)
+  4. Signs with the checked-in Android debug key, so no upstream release
+     keystore / secrets are needed and installs stay updatable.
+
+Every edit is done by pattern matching and is VERIFIED. If upstream refactors
+such that a pattern no longer matches (0 replacements) or a sanity check fails,
+this script exits non-zero with a loud, specific message so the pipeline fails
+red instead of shipping a silently-unpatched build.
+
+Usage:  patch.py <upstream_checkout_root>
+Config comes from env vars (with sensible defaults):
+  BA_PACKAGE   e.g. io.github.jackofnonetrades.blackamethyst
+  BA_APP_NAME  e.g. Black-Amethyst
+"""
+
+import os
+import re
+import sys
+
+PKG = os.environ.get("BA_PACKAGE", "io.github.jackofnonetrades.blackamethyst")
+APP_NAME = os.environ.get("BA_APP_NAME", "Black-Amethyst")
+
+# Java package segments: dot-separated, each starting with a letter.
+if not re.fullmatch(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+", PKG):
+    sys.exit(f"FATAL: BA_PACKAGE '{PKG}' is not a valid lowercase reverse-DNS package name")
+
+
+class PatchError(SystemExit):
+    def __init__(self, msg):
+        super().__init__(f"\n[PATCH FAILED] {msg}\n")
+
+
+def read(path):
+    if not os.path.isfile(path):
+        raise PatchError(f"expected file not found: {path}\n"
+                         f"  Upstream layout changed -- the heuristics need updating.")
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def write(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def sub_once(pattern, repl, text, what, flags=0):
+    """Substitute and REQUIRE exactly one match. Fail loudly otherwise."""
+    new, n = re.subn(pattern, repl, text, flags=flags)
+    if n == 0:
+        raise PatchError(f"could not locate: {what}\n"
+                         f"  pattern: {pattern!r}\n"
+                         f"  Upstream source changed -- update the heuristic in scripts/patch.py.")
+    if n > 1:
+        raise PatchError(f"expected 1 match but found {n} for: {what}\n"
+                         f"  pattern: {pattern!r}\n"
+                         f"  Ambiguous -- tighten the heuristic in scripts/patch.py.")
+    print(f"  [ok] {what}")
+    return new
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit("usage: patch.py <upstream_checkout_root>")
+    root = sys.argv[1]
+    app = os.path.join(root, "app_pojavlauncher")
+
+    print(f"Black-Amethyst patcher")
+    print(f"  package : {PKG}")
+    print(f"  appname : {APP_NAME}")
+    print(f"  target  : {root}")
+
+    # ------------------------------------------------------------------
+    # 1. THE FUNCTIONAL CHANGE: offline accounts with no internet.
+    #
+    # Upstream gates the "Local" (offline) account button behind
+    # hasNoOnlineProfileDialog(), which REFUSES to open the local-login
+    # screen unless you already have an *online* Microsoft profile. On a
+    # fresh, internet-less device that is a chicken-and-egg lock. We unwrap
+    # the gate so the button goes straight to LocalLoginFragment.
+    # ------------------------------------------------------------------
+    saf_path = os.path.join(app, "src/main/java/net/kdt/pojavlaunch/fragments/SelectAuthFragment.java")
+    saf = read(saf_path)
+    # Capture the inner swapFragment(...) call that targets LocalLoginFragment
+    # and drop the surrounding hasNoOnlineProfileDialog(requireActivity(), () -> ... ) wrapper.
+    saf = sub_once(
+        r"mLocalButton\.setOnClickListener\(\s*v\s*->\s*"
+        r"hasNoOnlineProfileDialog\(\s*requireActivity\(\)\s*,\s*\(\)\s*->\s*"
+        r"(?P<inner>Tools\.swapFragment\([^;]*?LocalLoginFragment[^;]*?\))"
+        r"\s*\)\s*\)\s*;",
+        r"mLocalButton.setOnClickListener(v -> \g<inner>);",
+        saf,
+        "offline-account gate on the Local login button",
+        flags=re.DOTALL,
+    )
+    # Verify the gate is gone from that button and the target is preserved.
+    button_line = next((l for l in saf.splitlines() if "mLocalButton.setOnClickListener" in l), "")
+    if "hasNoOnlineProfileDialog" in button_line:
+        raise PatchError("Local button still wrapped in hasNoOnlineProfileDialog after patch")
+    if "LocalLoginFragment" not in button_line:
+        raise PatchError("Local button no longer opens LocalLoginFragment after patch -- refusing to ship")
+    write(saf_path, saf)
+
+    # ------------------------------------------------------------------
+    # 2/3/4. Branding, package identity and signing -- all in build.gradle.
+    # ------------------------------------------------------------------
+    bg_path = os.path.join(app, "build.gradle")
+    bg = read(bg_path)
+
+    # applicationId (installed package id). namespace (net.kdt.pojavlaunch, the
+    # R/BuildConfig code package) is intentionally left untouched.
+    bg = sub_once(
+        r'applicationId\s+"org\.angelauramc\.amethyst"',
+        f'applicationId "{PKG}"',
+        bg, "applicationId -> our package",
+    )
+
+    # app_name / app_short_name in the *release* build type -> Black-Amethyst.
+    bg = sub_once(
+        r'(resValue\s+"string",\s*"app_name",\s*)"Amethyst"',
+        r'\1"' + APP_NAME + '"',
+        bg, 'release app_name -> ' + APP_NAME,
+    )
+    bg = sub_once(
+        r'(resValue\s+"string",\s*"app_short_name",\s*)"Amethyst"',
+        r'\1"' + APP_NAME + '"',
+        bg, 'release app_short_name -> ' + APP_NAME,
+    )
+
+    # application_package MUST equal applicationId: pref_control.xml fires an
+    # intent at @string/application_package to reach our own activity.
+    bg = sub_once(
+        r"(resValue\s+'string',\s*'application_package',\s*)'org\.angelauramc\.amethyst'",
+        r"\1'" + PKG + "'",
+        bg, "release application_package -> our package",
+    )
+
+    # FileProvider authority -> our namespace so the app can coexist with a
+    # stock Amethyst install instead of colliding on the provider authority.
+    bg = sub_once(
+        r"(resValue\s+'string',\s*'storageProviderAuthorities',\s*)'org\.angelauramc\.amethyst\.scoped\.gamefolder'",
+        r"\1'" + PKG + ".scoped.gamefolder'",
+        bg, "release storageProviderAuthorities -> our package",
+    )
+    # The release block doesn't set shareProviderAuthority; add one alongside
+    # storageProviderAuthorities so control-folder sharing is namespaced too.
+    bg = sub_once(
+        r"(resValue\s+'string',\s*'storageProviderAuthorities',\s*'" + re.escape(PKG) + r"\.scoped\.gamefolder'\n)",
+        r"\1            resValue 'string', 'shareProviderAuthority', '" + PKG + ".scoped.controlfolder'\n",
+        bg, "release shareProviderAuthority (added)",
+    )
+
+    # Sign the release with the checked-in debug keystore instead of the
+    # upstream release keystore (aamc_upload.jks) we don't have. Zero secrets,
+    # stable key across builds -> installs stay updatable.
+    bg = sub_once(
+        r"(release\s*\{[^}]*?signingConfig\s+signingConfigs\.)customRelease",
+        r"\1customDebug",
+        bg, "release signingConfig -> customDebug (self-signed, no secrets)",
+        flags=re.DOTALL,
+    )
+
+    write(bg_path, bg)
+
+    # Final belt-and-suspenders: the debug keystore we now rely on must exist.
+    ks = os.path.join(app, "debug.keystore")
+    if not os.path.isfile(ks):
+        raise PatchError(f"debug keystore missing at {ks} -- release build would be unsigned")
+
+    print("All patches applied and verified.")
+
+
+if __name__ == "__main__":
+    main()
