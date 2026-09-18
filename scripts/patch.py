@@ -110,6 +110,24 @@ def main():
         raise PatchError("Local button no longer opens LocalLoginFragment after patch -- refusing to ship")
     write(saf_path, saf)
 
+    # The SAME gate is duplicated inside LocalLoginFragment: on open it bounces
+    # straight back to the main menu when there's no online profile ("overkill
+    # but meh", per the upstream comment). Without removing this, the local-login
+    # screen silently closes the instant it opens, so the button "does nothing".
+    llf_path = os.path.join(app, "src/main/java/net/kdt/pojavlaunch/fragments/LocalLoginFragment.java")
+    llf = read(llf_path)
+    llf = sub_once(
+        r"if\s*\(\s*!hasOnlineProfile\(\)\s*\)\s*\{\s*"
+        r"Tools\.swapFragment\(\s*requireActivity\(\)\s*,\s*MainMenuFragment\.class\s*,\s*"
+        r"MainMenuFragment\.TAG\s*,\s*null\s*\)\s*;\s*\}",
+        "/* Black-Amethyst: local login allowed with no online profile */",
+        llf, "offline bounce-back guard in LocalLoginFragment",
+        flags=re.DOTALL,
+    )
+    if "!hasOnlineProfile()" in llf:
+        raise PatchError("LocalLoginFragment still guards on !hasOnlineProfile() after patch")
+    write(llf_path, llf)
+
     # ------------------------------------------------------------------
     # 2/3/4. Branding, package identity and signing -- all in build.gradle.
     # ------------------------------------------------------------------
