@@ -268,8 +268,16 @@ jobs:
           Upstream changelog: https://github.com/${UPSTREAM_REPO}/releases/tag/${UP}
           EOF
           )"
-          gh release create "${REL}" "${{ steps.apk.outputs.apk_path }}" \
-            -R "${GITHUB_REPOSITORY}" \
-            --title "Black-Amethyst ${UP}" \
-            --notes "${NOTES}"
-          echo "Published ${REL}."
+          APK="${{ steps.apk.outputs.apk_path }}"
+          if gh release view "${REL}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            # Force rebuild of an existing release: replace the asset and notes.
+            gh release upload "${REL}" "${APK}" --clobber -R "${GITHUB_REPOSITORY}"
+            gh release edit   "${REL}" -R "${GITHUB_REPOSITORY}" --title "Black-Amethyst ${UP}" --notes "${NOTES}"
+            echo "Updated ${REL}."
+          else
+            gh release create "${REL}" "${APK}" \
+              -R "${GITHUB_REPOSITORY}" \
+              --title "Black-Amethyst ${UP}" \
+              --notes "${NOTES}"
+            echo "Published ${REL}."
+          fi
