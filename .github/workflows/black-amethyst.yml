@@ -1,0 +1,248 @@
+name: Black-Amethyst release sync
+
+# Watches upstream AngelAuraMC/Amethyst-Android for new releases and, when one
+# appears, builds a rebranded "Black-Amethyst" APK that can add OFFLINE accounts
+# with no internet, then publishes it as a Release on this repo.
+#
+#   - Runs every 6 hours, and can be triggered by hand (Actions -> Run workflow).
+#   - If the newest upstream release was already built, the run ends green with
+#     nothing to do.
+#   - Any surprise (upstream tag not version-shaped, a patch heuristic that no
+#     longer matches, a missing JRE, an unsigned/absent APK) FAILS the run loudly
+#     rather than shipping something broken.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'      # every 6 hours
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild the latest upstream release even if already published'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write               # create releases on this repo
+
+env:
+  UPSTREAM_REPO: AngelAuraMC/Amethyst-Android
+  JRE_REPO: AngelAuraMC/angelauramc-openjdk-build
+  JRE_TAG: download_jre8
+  # --- the two knobs you might ever want to change ---
+  BA_PACKAGE: io.github.jackofnonetrades.blackamethyst
+  BA_APP_NAME: Black-Amethyst
+
+concurrency:
+  group: black-amethyst-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # ---------------------------------------------------------------
+      # 0. Our own repo (scripts live here).
+      # ---------------------------------------------------------------
+      - name: Checkout CI repo
+        uses: actions/checkout@v4
+        with:
+          path: ci
+
+      # ---------------------------------------------------------------
+      # 1. Decide whether there is anything new to build.
+      #    Heuristic: the upstream *latest* release tag must look like a
+      #    version (e.g. 1.1.7). Anything else stops the pipeline loudly.
+      # ---------------------------------------------------------------
+      - name: Resolve upstream release & decide
+        id: decide
+        run: |
+          set -euo pipefail
+          UP_TAG="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
+          echo "Upstream latest release tag: '${UP_TAG}'"
+
+          if ! [[ "${UP_TAG}" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::Upstream release tag '${UP_TAG}' is not version-shaped (expected e.g. 1.1.7). Refusing to guess."
+            exit 1
+          fi
+
+          REL_TAG="ba-${UP_TAG}"
+          echo "upstream_tag=${UP_TAG}"  >> "$GITHUB_OUTPUT"
+          echo "release_tag=${REL_TAG}"  >> "$GITHUB_OUTPUT"
+
+          FORCE="${{ github.event.inputs.force }}"
+          if [[ "${FORCE}" == "true" ]]; then
+            echo "Manual force requested -> will (re)build ${REL_TAG}."
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "${REL_TAG}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${REL_TAG} already exists -> nothing to do."
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No release ${REL_TAG} yet -> build it."
+            echo "build_needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Nothing to do
+        if: steps.decide.outputs.build_needed != 'true'
+        run: echo "Up to date with upstream ${{ steps.decide.outputs.upstream_tag }}. Exiting green."
+
+      # ---------------------------------------------------------------
+      # 2. Fetch upstream source at the target tag (+ submodules).
+      #    androidnsbypass uses an SSH submodule URL; rewrite to HTTPS so
+      #    it clones without an SSH key.
+      # ---------------------------------------------------------------
+      - name: Checkout upstream ${{ steps.decide.outputs.upstream_tag }}
+        if: steps.decide.outputs.build_needed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.decide.outputs.upstream_tag }}
+          path: src
+          submodules: false
+          fetch-depth: 0
+
+      - name: Init submodules (SSH -> HTTPS)
+        if: steps.decide.outputs.build_needed == 'true'
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git submodule update --init --recursive --depth 1
+
+      # ---------------------------------------------------------------
+      # 3. Toolchains: JDK 21 (gradle build) + JDK 8 (pack200 for JRE repack).
+      # ---------------------------------------------------------------
+      - name: Set up JDK 8 (for pack200)
+        if: steps.decide.outputs.build_needed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Set up JDK 21 (for gradle)
+        if: steps.decide.outputs.build_needed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Android NDK
+        if: steps.decide.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          # Read the NDK version this upstream tag actually asks for, so the
+          # pipeline keeps working as upstream bumps its toolchain.
+          NDK_VER="$(grep -oE 'ndkVersion\s*=\s*"[^"]+"' src/app_pojavlauncher/build.gradle | grep -oE '[0-9][0-9.]+' | head -1)"
+          NDK_VER="${NDK_VER:-27.3.13750724}"
+          echo "Tag requests NDK ${NDK_VER}"
+          SDKMGR="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "${SDKMGR}" --licenses >/dev/null 2>&1 || true
+          "${SDKMGR}" "ndk;${NDK_VER}" >/dev/null || \
+            echo "::warning::Explicit NDK install failed; relying on Gradle auto-provisioning."
+
+      # ---------------------------------------------------------------
+      # 4. Bundle the offline Android JRE 8 (stable Release assets, repacked
+      #    into Pojav's components/jre layout). Required: the target phone has
+      #    no internet, so the runtime cannot be downloaded in-app.
+      # ---------------------------------------------------------------
+      - name: Download JRE 8 (per-arch) from ${{ env.JRE_REPO }}
+        if: steps.decide.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p jre_dl
+          for arch in arm arm64 x86 x86_64; do
+            gh release download "${JRE_TAG}" -R "${JRE_REPO}" \
+              -p "jre8-android-${arch}.tar.xz" -D jre_dl
+          done
+          ls -la jre_dl
+
+      - name: Repack JRE into components/jre
+        if: steps.decide.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          DEST="src/app_pojavlauncher/src/main/assets/components/jre"
+          mkdir -p "${DEST}"
+          # pack200 ships with JDK 8, not JDK 21 -> put JDK 8 first on PATH here.
+          PATH="${JAVA_HOME_8_X64}/bin:${PATH}" bash ci/scripts/repack_jre.sh "${PWD}/jre_dl" "${PWD}/${DEST}"
+          test -s "${DEST}/universal.tar.xz" || { echo "::error::JRE repack produced no universal.tar.xz"; exit 1; }
+
+      # ---------------------------------------------------------------
+      # 5. Apply the rebrand + offline-account patches (fails loud if a
+      #    heuristic no longer matches upstream source).
+      # ---------------------------------------------------------------
+      - name: Apply Black-Amethyst patches
+        if: steps.decide.outputs.build_needed == 'true'
+        run: python3 ci/scripts/patch.py src
+
+      - name: Regenerate language list
+        if: steps.decide.outputs.build_needed == 'true'
+        working-directory: src
+        run: bash ./scripts/languagelist_updater.sh
+
+      # ---------------------------------------------------------------
+      # 6. Build the release APK (self-signed with the checked-in debug key).
+      # ---------------------------------------------------------------
+      - name: Set up Gradle
+        if: steps.decide.outputs.build_needed == 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          validate-wrappers: false
+
+      # Build with the tag's OWN wrapper (./gradlew), so each upstream release
+      # builds with the exact Gradle version it was written for. (1.1.7 -> 8.13;
+      # newer tags may use 9.x. Pinning one Gradle version breaks older/newer tags.)
+      - name: Build release APK
+        if: steps.decide.outputs.build_needed == 'true'
+        working-directory: src
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app_pojavlauncher:assembleRelease --no-daemon --stacktrace
+
+      - name: Stage & verify APK
+        if: steps.decide.outputs.build_needed == 'true'
+        id: apk
+        run: |
+          set -euo pipefail
+          SRC_APK="src/app_pojavlauncher/build/outputs/apk/release/app_pojavlauncher-release.apk"
+          test -s "${SRC_APK}" || { echo "::error::Release APK not found at ${SRC_APK}"; exit 1; }
+
+          OUT="Black-Amethyst-${{ steps.decide.outputs.upstream_tag }}.apk"
+          cp "${SRC_APK}" "${OUT}"
+
+          # Confirm it is actually signed (self-signed debug key is fine).
+          BT="$(ls -d ${ANDROID_HOME}/build-tools/*/ | sort -V | tail -1)"
+          if [ -x "${BT}apksigner" ]; then
+            "${BT}apksigner" verify --print-certs "${OUT}" | head -5
+          else
+            echo "::warning::apksigner not found; skipping signature verification."
+          fi
+          echo "apk_path=${OUT}" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------
+      # 7. Publish the release on this repo.
+      # ---------------------------------------------------------------
+      - name: Publish Black-Amethyst release
+        if: steps.decide.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          UP="${{ steps.decide.outputs.upstream_tag }}"
+          REL="${{ steps.decide.outputs.release_tag }}"
+          NOTES="$(cat <<EOF
+          Automated build of **Black-Amethyst** tracking upstream Amethyst-Android \`${UP}\`.
+
+          Changed from upstream:
+          - **Offline accounts work with no internet, right off the bat** — the "Local" account button no longer requires a pre-existing online account.
+          - Rebranded to **${BA_APP_NAME}**, package \`${BA_PACKAGE}\` (installs alongside stock Amethyst).
+          - Self-signed with the debug key (sideload build; updatable across releases).
+          - Bundled offline JRE 8, so no in-app runtime download is needed.
+
+          Upstream release: https://github.com/${UPSTREAM_REPO}/releases/tag/${UP}
+          EOF
+          )"
+          gh release create "${REL}" "${{ steps.apk.outputs.apk_path }}" \
+            -R "${GITHUB_REPOSITORY}" \
+            --title "Black-Amethyst ${UP}" \
+            --notes "${NOTES}"
+          echo "Published ${REL}."
