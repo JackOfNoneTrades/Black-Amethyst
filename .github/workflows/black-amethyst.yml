@@ -176,6 +176,20 @@ jobs:
         if: steps.decide.outputs.build_needed == 'true'
         run: python3 ci/scripts/patch.py src
 
+      - name: Overlay custom app icon
+        if: steps.decide.outputs.build_needed == 'true'
+        run: |
+          set -euo pipefail
+          RES="src/app_pojavlauncher/src/main/res"
+          test -d ci/icon/res || { echo "::error::icon overlay ci/icon/res missing"; exit 1; }
+          cp -rv ci/icon/res/. "${RES}/"
+          # sanity: our layers must now be in place
+          for f in mipmap-xxxhdpi/ic_launcher_foreground.webp \
+                   mipmap-xxxhdpi/ic_launcher.webp \
+                   drawable/notif_icon.png; do
+            test -f "${RES}/${f}" || { echo "::error::icon overlay missing ${f}"; exit 1; }
+          done
+
       - name: Regenerate language list
         if: steps.decide.outputs.build_needed == 'true'
         working-directory: src
