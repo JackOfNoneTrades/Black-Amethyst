@@ -207,9 +207,27 @@ jobs:
       # Build with the tag's OWN wrapper (./gradlew), so each upstream release
       # builds with the exact Gradle version it was written for. (1.1.7 -> 8.13;
       # newer tags may use 9.x. Pinning one Gradle version breaks older/newer tags.)
+      - name: Decode signing keystore
+        if: steps.decide.outputs.build_needed == 'true'
+        env:
+          BA_KEYSTORE_B64: ${{ secrets.BA_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BA_KEYSTORE_B64:-}" ]; then
+            echo "::error::Secret BA_KEYSTORE_B64 is not set. Add your release keystore (base64) and BA_KEYSTORE_PASSWORD as repository secrets."
+            exit 1
+          fi
+          printf '%s' "${BA_KEYSTORE_B64}" | base64 -d > "${{ github.workspace }}/blackamethyst-release.jks"
+          test -s "${{ github.workspace }}/blackamethyst-release.jks" || { echo "::error::decoded keystore is empty"; exit 1; }
+
       - name: Build release APK
         if: steps.decide.outputs.build_needed == 'true'
         working-directory: src
+        env:
+          BA_KEYSTORE_FILE: ${{ github.workspace }}/blackamethyst-release.jks
+          BA_KEYSTORE_PASSWORD: ${{ secrets.BA_KEYSTORE_PASSWORD }}
+          BA_KEY_ALIAS: blackamethyst
+          BA_KEY_PASSWORD: ${{ secrets.BA_KEYSTORE_PASSWORD }}
         run: |
           chmod +x ./gradlew
           ./gradlew :app_pojavlauncher:assembleRelease --no-daemon --stacktrace
@@ -225,13 +243,14 @@ jobs:
           OUT="Black-Amethyst-${{ steps.decide.outputs.upstream_tag }}.apk"
           cp "${SRC_APK}" "${OUT}"
 
-          # Confirm it is actually signed (self-signed debug key is fine).
+          # Confirm it's signed with OUR release key, not the debug key.
           BT="$(ls -d ${ANDROID_HOME}/build-tools/*/ | sort -V | tail -1)"
-          if [ -x "${BT}apksigner" ]; then
-            "${BT}apksigner" verify --print-certs "${OUT}" | head -5
-          else
-            echo "::warning::apksigner not found; skipping signature verification."
+          CERTS="$("${BT}apksigner" verify --print-certs "${OUT}")"
+          echo "${CERTS}" | grep -E "certificate DN|SHA-256" | head -4
+          if echo "${CERTS}" | grep -q "CN=Android Debug"; then
+            echo "::error::APK is debug-signed, not signed with the release keystore"; exit 1
           fi
+          echo "${CERTS}" | grep -q "CN=Black-Amethyst" || { echo "::error::APK not signed by the expected Black-Amethyst key"; exit 1; }
           echo "apk_path=${OUT}" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------

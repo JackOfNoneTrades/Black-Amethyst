@@ -159,22 +159,25 @@ def main():
         bg, "release shareProviderAuthority (added)",
     )
 
-    # Sign the release with the checked-in debug keystore instead of the
-    # upstream release keystore (aamc_upload.jks) we don't have. Zero secrets,
-    # stable key across builds -> installs stay updatable.
+    # Point the release signing config at OUR keystore, provided by CI from repo
+    # secrets via env vars, instead of upstream's release keystore (which isn't
+    # in the repo). The release build type keeps using customRelease, so the
+    # published APK is signed with our own stable key.
     bg = sub_once(
-        r"(release\s*\{[^}]*?signingConfig\s+signingConfigs\.)customRelease",
-        r"\1customDebug",
-        bg, "release signingConfig -> customDebug (self-signed, no secrets)",
+        r"customRelease\s*\{[^}]*\}",
+        (
+            'customRelease {\n'
+            '            storeFile file(System.getenv("BA_KEYSTORE_FILE"))\n'
+            '            storePassword System.getenv("BA_KEYSTORE_PASSWORD")\n'
+            '            keyAlias System.getenv("BA_KEY_ALIAS")\n'
+            '            keyPassword System.getenv("BA_KEY_PASSWORD")\n'
+            '        }'
+        ),
+        bg, "customRelease signingConfig -> our keystore (from CI secrets)",
         flags=re.DOTALL,
     )
 
     write(bg_path, bg)
-
-    # Final belt-and-suspenders: the debug keystore we now rely on must exist.
-    ks = os.path.join(app, "debug.keystore")
-    if not os.path.isfile(ks):
-        raise PatchError(f"debug keystore missing at {ks} -- release build would be unsigned")
 
     print("All patches applied and verified.")
 
