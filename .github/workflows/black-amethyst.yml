@@ -244,15 +244,9 @@ jobs:
           UP="${{ steps.decide.outputs.upstream_tag }}"
           REL="${{ steps.decide.outputs.release_tag }}"
           NOTES="$(cat <<EOF
-          Automated build of **Black-Amethyst** tracking upstream Amethyst-Android \`${UP}\`.
+          Automated Black-Amethyst build of upstream Amethyst-Android \`${UP}\`.
 
-          Changed from upstream:
-          - **Offline accounts work with no internet, right off the bat** — the "Local" account button no longer requires a pre-existing online account.
-          - Rebranded to **${BA_APP_NAME}**, package \`${BA_PACKAGE}\` (installs alongside stock Amethyst).
-          - Self-signed with the debug key (sideload build; updatable across releases).
-          - Bundled offline JRE 8, so no in-app runtime download is needed.
-
-          Upstream release: https://github.com/${UPSTREAM_REPO}/releases/tag/${UP}
+          Upstream changelog: https://github.com/${UPSTREAM_REPO}/releases/tag/${UP}
           EOF
           )"
           gh release create "${REL}" "${{ steps.apk.outputs.apk_path }}" \
