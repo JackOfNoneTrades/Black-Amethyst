@@ -128,6 +128,22 @@ def main():
         raise PatchError("LocalLoginFragment still guards on !hasOnlineProfile() after patch")
     write(llf_path, llf)
 
+    # Let a LOCAL/offline account download game files whenever the device is
+    # online. Upstream skips downloadGame() for any local profile, so an offline
+    # account can never fetch a version even when the files are reachable (here,
+    # via a transparent local mirror of Mojang's endpoints). Gate the download on
+    # connectivity alone; when truly offline it still falls back to local files.
+    mcd_path = os.path.join(app, "src/main/java/net/kdt/pojavlaunch/tasks/MinecraftDownloader.java")
+    mcd = read(mcd_path)
+    mcd = sub_once(
+        r"if\s*\(\s*isLocalProfile\s*\|\|\s*!isOnline\s*\)",
+        "if (!isOnline)",
+        mcd, "download gate: allow local accounts to download when online",
+    )
+    if re.search(r"isLocalProfile\s*\|\|\s*!isOnline", mcd):
+        raise PatchError("MinecraftDownloader still blocks downloads for local profiles")
+    write(mcd_path, mcd)
+
     # ------------------------------------------------------------------
     # 2/3/4. Branding, package identity and signing -- all in build.gradle.
     # ------------------------------------------------------------------
