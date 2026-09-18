@@ -65,7 +65,13 @@ Both live at the top of the workflow's `env:` block:
 .github/workflows/black-amethyst.yml   the pipeline
 scripts/patch.py                       rebrand + offline-account patcher (verified)
 scripts/repack_jre.sh                  repacks Android JRE 8 into Pojav's layout
+scripts/regen_icons.sh                 rebuilds the icon overlay from icon/master/
+icon/master/                           hand-edited icon sources (PNG)
+icon/res/                              generated per-density overlay (copied onto upstream res/)
 ```
+
+To change the app icon: edit the PNGs in `icon/master/`, run `scripts/regen_icons.sh`,
+commit. The CI lays `icon/res/` over upstream's resources before each build.
 
 ## Notes
 
